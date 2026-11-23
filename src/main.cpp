@@ -21,6 +21,14 @@ static uint32_t lastWifiTry = 0;
 static char syncCodes[16][65];
 static int syncCount = 0;
 
+struct DesiredMode {
+  char code[65];
+  uint8_t mode;
+};
+
+static DesiredMode desiredModes[32];
+static int desiredCount = 0;
+
 struct Upstream {
   bool https;
   String host;
@@ -418,6 +426,22 @@ static bool sendTimeCommand() {
   return true;
 }
 
+static bool sendModeCommand(uint8_t mode) {
+  if (mode != SMARTTRAP_MODE_COLLECT && mode != SMARTTRAP_MODE_INFER) {
+    return false;
+  }
+  SmartTrapModeDownlink command = {};
+  command.magic = SMARTTRAP_MAGIC;
+  command.kind = SMARTTRAP_KIND_MODE;
+  command.operating_mode = mode;
+  LoRa.beginPacket();
+  LoRa.write(reinterpret_cast<const uint8_t *>(&command), sizeof(command));
+  LoRa.endPacket();
+  LoRa.receive();
+  Serial.printf("Modo %s enviado por LoRa\n", mode == SMARTTRAP_MODE_INFER ? "infer" : "collect");
+  return true;
+}
+
 static bool validCode(const char *code) {
   if (code[0] == '\0') {
     return false;
@@ -481,6 +505,69 @@ static void pollClockSync() {
   Serial.printf("Ajustes de relógio pendentes: %d\n", syncCount);
 }
 
+static int desiredModeFor(const char *code) {
+  for (int index = 0; index < desiredCount; index++) {
+    if (strcmp(desiredModes[index].code, code) == 0) {
+      return desiredModes[index].mode;
+    }
+  }
+  return -1;
+}
+
+static void pollModes() {
+  String url = String(API_BASE) + "/api/v1/ingest/modes";
+  WiFiClient plain;
+  WiFiClientSecure secure;
+  HTTPClient http;
+  if (!beginHttp(http, plain, secure, url)) {
+    return;
+  }
+  int code = http.GET();
+  if (code != 200) {
+    http.end();
+    return;
+  }
+  String body = http.getString();
+  http.end();
+  desiredCount = 0;
+  int cursor = 0;
+  while (desiredCount < 32) {
+    int key = body.indexOf("\"device_code\"", cursor);
+    if (key < 0) {
+      break;
+    }
+    int colon = body.indexOf(':', key);
+    int open = colon < 0 ? -1 : body.indexOf('"', colon + 1);
+    int close = open < 0 ? -1 : body.indexOf('"', open + 1);
+    if (close < 0) {
+      break;
+    }
+    String deviceCode = body.substring(open + 1, close);
+    int modeKey = body.indexOf("\"operating_mode\"", close);
+    int modeColon = modeKey < 0 ? -1 : body.indexOf(':', modeKey);
+    int modeOpen = modeColon < 0 ? -1 : body.indexOf('"', modeColon + 1);
+    int modeClose = modeOpen < 0 ? -1 : body.indexOf('"', modeOpen + 1);
+    if (modeClose < 0) {
+      break;
+    }
+    String modeName = body.substring(modeOpen + 1, modeClose);
+    uint8_t mode = 255;
+    if (modeName == "collect") {
+      mode = SMARTTRAP_MODE_COLLECT;
+    } else if (modeName == "infer") {
+      mode = SMARTTRAP_MODE_INFER;
+    }
+    if (validCode(deviceCode.c_str()) && mode != 255) {
+      strncpy(desiredModes[desiredCount].code, deviceCode.c_str(), sizeof(desiredModes[desiredCount].code) - 1);
+      desiredModes[desiredCount].code[sizeof(desiredModes[desiredCount].code) - 1] = '\0';
+      desiredModes[desiredCount].mode = mode;
+      desiredCount++;
+    }
+    cursor = modeClose + 1;
+  }
+  Serial.printf("Modos conhecidos: %d\n", desiredCount);
+}
+
 static String isoNow() {
   time_t now = time(nullptr);
   struct tm clock;
@@ -490,7 +577,7 @@ static String isoNow() {
   return String(iso);
 }
 
-static void postMetric(const SmartTrapUplink &packet, int rssi, float snr, bool hasClock) {
+static void postMetric(const SmartTrapUplink &packet, int rssi, float snr, bool hasClock, bool hasMode) {
   if (!validCode(packet.device_code) || WiFi.status() != WL_CONNECTED) {
     Serial.println("Métrica não enviada");
     return;
@@ -515,6 +602,11 @@ static void postMetric(const SmartTrapUplink &packet, int rssi, float snr, bool 
     json += ",\"device_time\":";
     json += String(packet.unix_time);
   }
+  if (hasMode) {
+    json += ",\"operating_mode\":\"";
+    json += packet.operating_mode == SMARTTRAP_MODE_INFER ? "infer" : "collect";
+    json += "\"";
+  }
   json += ",\"rssi\":";
   json += String(rssi);
   json += ",\"snr\":";
@@ -534,7 +626,7 @@ static void postMetric(const SmartTrapUplink &packet, int rssi, float snr, bool 
   http.end();
 }
 
-static void postClock(const char *deviceCode, uint32_t unixTime) {
+static void postClock(const char *deviceCode, uint32_t unixTime, bool hasMode, uint8_t mode) {
   if (!validCode(deviceCode) || WiFi.status() != WL_CONNECTED) {
     return;
   }
@@ -542,6 +634,11 @@ static void postClock(const char *deviceCode, uint32_t unixTime) {
   json += deviceCode;
   json += "\",\"device_time\":";
   json += String(unixTime);
+  if (hasMode) {
+    json += ",\"operating_mode\":\"";
+    json += mode == SMARTTRAP_MODE_INFER ? "infer" : "collect";
+    json += "\"";
+  }
   json += "}";
   String url = String(API_BASE) + "/api/v1/ingest/clock";
   WiFiClient plain;
@@ -556,28 +653,32 @@ static void postClock(const char *deviceCode, uint32_t unixTime) {
   http.end();
 }
 
-static void handlePacket(SmartTrapUplink packet, int rssi, float snr, bool hasClock) {
+static void handlePacket(SmartTrapUplink packet, int rssi, float snr, bool hasClock, bool hasMode) {
   packet.device_code[sizeof(packet.device_code) - 1] = '\0';
   if (packet.magic != SMARTTRAP_MAGIC || packet.kind != SMARTTRAP_KIND_METRIC) {
     return;
   }
-  Serial.printf("Pacote %s fw %u relógio %u\n", packet.device_code, packet.fw_version, hasClock ? packet.unix_time : 0);
-  bool sentTime = false;
+  Serial.printf("Pacote %s fw %u relógio %u modo %u\n", packet.device_code, packet.fw_version, hasClock ? packet.unix_time : 0, hasMode ? packet.operating_mode : 255);
+  bool sent = false;
   if (hasClock && syncPending(packet.device_code)) {
-    sentTime = sendTimeCommand();
+    sent = sendTimeCommand();
   }
-  if (!sentTime && publishedTrapVersion > packet.fw_version) {
+  int desired = hasMode ? desiredModeFor(packet.device_code) : -1;
+  if (!sent && desired >= 0 && desired != packet.operating_mode) {
+    sent = sendModeCommand((uint8_t)desired);
+  }
+  if (!sent && publishedTrapVersion > packet.fw_version) {
     sendOtaCommand();
   }
   LoRa.receive();
   if (packet.model_ok == 0) {
     Serial.println("Sem modelo; métrica omitida");
     if (hasClock) {
-      postClock(packet.device_code, packet.unix_time);
+      postClock(packet.device_code, packet.unix_time, hasMode, packet.operating_mode);
     }
     return;
   }
-  postMetric(packet, rssi, snr, hasClock);
+  postMetric(packet, rssi, snr, hasClock, hasMode);
 }
 
 static void pollCloud() {
@@ -585,6 +686,7 @@ static void pollCloud() {
     return;
   }
   pollClockSync();
+  pollModes();
   int trapVersion = fetchVersion("smarttrap");
   if (trapVersion >= 0) {
     publishedTrapVersion = trapVersion;
@@ -612,13 +714,16 @@ static void readLora() {
   }
   int rssi = LoRa.packetRssi();
   float snr = LoRa.packetSnr();
-  if (got != (int)SMARTTRAP_UPLINK_LEGACY_SIZE && got != (int)sizeof(SmartTrapUplink)) {
+  bool legacy = got == (int)SMARTTRAP_UPLINK_LEGACY_SIZE;
+  bool clockOnly = got == (int)SMARTTRAP_UPLINK_CLOCK_SIZE;
+  bool full = got == (int)sizeof(SmartTrapUplink);
+  if (!legacy && !clockOnly && !full) {
     LoRa.receive();
     return;
   }
   SmartTrapUplink packet = {};
   memcpy(&packet, buffer, got);
-  handlePacket(packet, rssi, snr, got == (int)sizeof(SmartTrapUplink));
+  handlePacket(packet, rssi, snr, clockOnly || full, full);
 }
 
 void setup() {
