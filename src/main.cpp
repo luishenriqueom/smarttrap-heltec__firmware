@@ -18,6 +18,8 @@ static bool apReady = false;
 static int publishedTrapVersion = -1;
 static uint32_t lastPoll = 0;
 static uint32_t lastWifiTry = 0;
+static char syncCodes[16][65];
+static int syncCount = 0;
 
 struct Upstream {
   bool https;
@@ -398,6 +400,24 @@ static void sendOtaCommand() {
   Serial.println("Comando OTA enviado por LoRa");
 }
 
+static bool sendTimeCommand() {
+  time_t now = time(nullptr);
+  if (now <= 1700000000) {
+    Serial.println("Relógio do Heltec indefinido; ajuste adiado");
+    return false;
+  }
+  SmartTrapTimeDownlink command = {};
+  command.magic = SMARTTRAP_MAGIC;
+  command.kind = SMARTTRAP_KIND_TIME;
+  command.unix_time = (uint32_t)now;
+  LoRa.beginPacket();
+  LoRa.write(reinterpret_cast<const uint8_t *>(&command), sizeof(command));
+  LoRa.endPacket();
+  LoRa.receive();
+  Serial.printf("Horário %u enviado por LoRa\n", command.unix_time);
+  return true;
+}
+
 static bool validCode(const char *code) {
   if (code[0] == '\0') {
     return false;
@@ -413,6 +433,54 @@ static bool validCode(const char *code) {
   return true;
 }
 
+static bool syncPending(const char *code) {
+  for (int index = 0; index < syncCount; index++) {
+    if (strcmp(syncCodes[index], code) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static void pollClockSync() {
+  String url = String(API_BASE) + "/api/v1/ingest/clock-sync";
+  WiFiClient plain;
+  WiFiClientSecure secure;
+  HTTPClient http;
+  if (!beginHttp(http, plain, secure, url)) {
+    return;
+  }
+  int code = http.GET();
+  if (code != 200) {
+    http.end();
+    return;
+  }
+  String body = http.getString();
+  http.end();
+  syncCount = 0;
+  int cursor = 0;
+  while (syncCount < 16) {
+    int key = body.indexOf("\"device_code\"", cursor);
+    if (key < 0) {
+      break;
+    }
+    int colon = body.indexOf(':', key);
+    int open = colon < 0 ? -1 : body.indexOf('"', colon + 1);
+    int close = open < 0 ? -1 : body.indexOf('"', open + 1);
+    if (close < 0) {
+      break;
+    }
+    String deviceCode = body.substring(open + 1, close);
+    if (validCode(deviceCode.c_str())) {
+      strncpy(syncCodes[syncCount], deviceCode.c_str(), sizeof(syncCodes[0]) - 1);
+      syncCodes[syncCount][sizeof(syncCodes[0]) - 1] = '\0';
+      syncCount++;
+    }
+    cursor = close + 1;
+  }
+  Serial.printf("Ajustes de relógio pendentes: %d\n", syncCount);
+}
+
 static String isoNow() {
   time_t now = time(nullptr);
   struct tm clock;
@@ -422,7 +490,7 @@ static String isoNow() {
   return String(iso);
 }
 
-static void postMetric(const SmartTrapUplink &packet, int rssi, float snr) {
+static void postMetric(const SmartTrapUplink &packet, int rssi, float snr, bool hasClock) {
   if (!validCode(packet.device_code) || WiFi.status() != WL_CONNECTED) {
     Serial.println("Métrica não enviada");
     return;
@@ -443,6 +511,10 @@ static void postMetric(const SmartTrapUplink &packet, int rssi, float snr) {
     json += ",\"battery_v\":";
     json += String(packet.battery_mv / 1000.0f, 2);
   }
+  if (hasClock) {
+    json += ",\"device_time\":";
+    json += String(packet.unix_time);
+  }
   json += ",\"rssi\":";
   json += String(rssi);
   json += ",\"snr\":";
@@ -462,27 +534,57 @@ static void postMetric(const SmartTrapUplink &packet, int rssi, float snr) {
   http.end();
 }
 
-static void handlePacket(SmartTrapUplink packet, int rssi, float snr) {
+static void postClock(const char *deviceCode, uint32_t unixTime) {
+  if (!validCode(deviceCode) || WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+  String json = "{\"device_code\":\"";
+  json += deviceCode;
+  json += "\",\"device_time\":";
+  json += String(unixTime);
+  json += "}";
+  String url = String(API_BASE) + "/api/v1/ingest/clock";
+  WiFiClient plain;
+  WiFiClientSecure secure;
+  HTTPClient http;
+  if (!beginHttp(http, plain, secure, url)) {
+    return;
+  }
+  http.addHeader("Content-Type", "application/json");
+  int code = http.POST(json);
+  Serial.printf("POST relógio -> HTTP %d\n", code);
+  http.end();
+}
+
+static void handlePacket(SmartTrapUplink packet, int rssi, float snr, bool hasClock) {
   packet.device_code[sizeof(packet.device_code) - 1] = '\0';
   if (packet.magic != SMARTTRAP_MAGIC || packet.kind != SMARTTRAP_KIND_METRIC) {
     return;
   }
-  Serial.printf("Pacote %s fw %u\n", packet.device_code, packet.fw_version);
-  if (publishedTrapVersion > packet.fw_version) {
+  Serial.printf("Pacote %s fw %u relógio %u\n", packet.device_code, packet.fw_version, hasClock ? packet.unix_time : 0);
+  bool sentTime = false;
+  if (hasClock && syncPending(packet.device_code)) {
+    sentTime = sendTimeCommand();
+  }
+  if (!sentTime && publishedTrapVersion > packet.fw_version) {
     sendOtaCommand();
   }
   LoRa.receive();
   if (packet.model_ok == 0) {
     Serial.println("Sem modelo; métrica omitida");
+    if (hasClock) {
+      postClock(packet.device_code, packet.unix_time);
+    }
     return;
   }
-  postMetric(packet, rssi, snr);
+  postMetric(packet, rssi, snr, hasClock);
 }
 
 static void pollCloud() {
   if (WiFi.status() != WL_CONNECTED) {
     return;
   }
+  pollClockSync();
   int trapVersion = fetchVersion("smarttrap");
   if (trapVersion >= 0) {
     publishedTrapVersion = trapVersion;
@@ -510,13 +612,13 @@ static void readLora() {
   }
   int rssi = LoRa.packetRssi();
   float snr = LoRa.packetSnr();
-  if (got != (int)sizeof(SmartTrapUplink)) {
+  if (got != (int)SMARTTRAP_UPLINK_LEGACY_SIZE && got != (int)sizeof(SmartTrapUplink)) {
     LoRa.receive();
     return;
   }
-  SmartTrapUplink packet;
-  memcpy(&packet, buffer, sizeof(packet));
-  handlePacket(packet, rssi, snr);
+  SmartTrapUplink packet = {};
+  memcpy(&packet, buffer, got);
+  handlePacket(packet, rssi, snr, got == (int)sizeof(SmartTrapUplink));
 }
 
 void setup() {
