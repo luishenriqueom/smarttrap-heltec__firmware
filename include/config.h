@@ -9,7 +9,7 @@
 #define AP_SSID "smarttrap-gw"
 #define AP_PASSWORD "smarttrap-gw"
 
-#define API_BASE "http://192.168.0.4:8000"
+#define API_BASE "https://st-api.lcdlabs.com.br"
 #define API_KEY "CHANGE_ME"
 
 #define LORA_MOSI 27
